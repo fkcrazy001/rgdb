@@ -1,0 +1,19 @@
+[package]
+name = "rgdb"
+version = "0.1.0"
+edition = "2024"
+description = "Gdb write in Rust"
+
+[[bin]]
+name = "hello"
+path = "src/hello.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+
+nix = { version = "0.31.2", features = ["ptrace", "process"] }
+gimli = "0.33.0"
+log = "0.4.29"
+rustyline = "17.0.2"
+shlex = "1.3.0"
