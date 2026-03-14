@@ -56,6 +56,8 @@ enum SubCommands {
     Next,
     #[command(alias = "fin")]
     Finish,
+    #[command(alias = "bt")]
+    Backtrace,
 }
 
 #[derive(Subcommand, Debug)]
@@ -230,6 +232,7 @@ impl Debugger {
                             SubCommands::Step => self.step_source()?,
                             SubCommands::Next => self.next_source()?,
                             SubCommands::Finish => self.finish()?,
+                            SubCommands::Backtrace => self.backtrace()?,
                         },
                         Err(e) => {
                             error!("cmd parse failed, {e}");
@@ -311,6 +314,43 @@ impl Debugger {
                 info!("Process killed by signal {:?}", sig);
             }
             _ => info!("process received status {:?}", status),
+        }
+        Ok(())
+    }
+
+    fn backtrace(&self) -> anyhow::Result<()> {
+        let mut pc = self.get_pc()?;
+        #[cfg(target_arch = "x86_64")]
+        let mut fp = ptrace::getregs(self.process)?.rbp;
+        #[cfg(target_arch = "aarch64")]
+        let mut fp = ptrace::getregs(self.process)?.x[29];
+
+        let mut frame_num = 0;
+        loop {
+            let mut line_info = String::new();
+            if let Ok(Some(loc)) = self.lookup_source_location(pc) {
+                line_info = format!(" at {}:{}:{}", loc.file, loc.line, loc.column);
+            }
+            println!("#{} 0x{:016x}{}", frame_num, pc, line_info);
+
+            if fp == 0 {
+                break;
+            }
+
+            // Follow frame pointer
+            match ptrace::read(self.process, (fp + 8) as _) {
+                Ok(ret_addr) => pc = ret_addr as u64,
+                Err(_) => break,
+            }
+            match ptrace::read(self.process, fp as _) {
+                Ok(next_fp) => fp = next_fp as u64,
+                Err(_) => break,
+            }
+
+            frame_num += 1;
+            if frame_num > 50 {
+                break;
+            }
         }
         Ok(())
     }
