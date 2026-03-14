@@ -58,6 +58,8 @@ enum SubCommands {
     Finish,
     #[command(alias = "bt")]
     Backtrace,
+    #[command(alias = "p")]
+    Print { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -233,6 +235,7 @@ impl Debugger {
                             SubCommands::Next => self.next_source()?,
                             SubCommands::Finish => self.finish()?,
                             SubCommands::Backtrace => self.backtrace()?,
+                            SubCommands::Print { name } => self.print_variable(&name)?,
                         },
                         Err(e) => {
                             error!("cmd parse failed, {e}");
@@ -316,6 +319,168 @@ impl Debugger {
             _ => info!("process received status {:?}", status),
         }
         Ok(())
+    }
+
+    fn print_variable(&self, name: &str) -> anyhow::Result<()> {
+        let pc = self.get_pc()?;
+        let offset = if pc >= self.load_address as u64 {
+            pc - self.load_address as u64
+        } else {
+            pc
+        };
+
+        let dwarf = match &self.dwarf {
+            Some(d) => d,
+            None => {
+                error!("no debug info");
+                return Ok(());
+            }
+        };
+
+        let mut iter = dwarf.units();
+        while let Some(header) = iter.next()? {
+            let unit = dwarf.unit(header)?;
+            let mut entries = unit.entries();
+            let mut current_subprogram = None;
+
+            while let Some(entry) = entries.next_dfs()? {
+                if entry.tag() == gimli::DW_TAG_subprogram {
+                    let mut low_pc = 0;
+                    let mut high_pc = 0;
+                    for attr in entry.attrs() {
+                        match attr.name() {
+                            gimli::DW_AT_low_pc => {
+                                if let gimli::AttributeValue::Addr(addr) = attr.value() {
+                                    low_pc = addr;
+                                }
+                            }
+                            gimli::DW_AT_high_pc => match attr.value() {
+                                gimli::AttributeValue::Udata(size) => high_pc = low_pc + size,
+                                gimli::AttributeValue::Addr(addr) => high_pc = addr,
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+
+                    if offset >= low_pc && offset < high_pc {
+                        current_subprogram = Some(entry.offset());
+                    }
+                }
+
+                if let Some(_sub_offset) = current_subprogram {
+                    if entry.tag() == gimli::DW_TAG_variable
+                        || entry.tag() == gimli::DW_TAG_formal_parameter
+                    {
+                        let mut name_match = false;
+                        let mut location = None;
+
+                        for attr in entry.attrs() {
+                            match attr.name() {
+                                gimli::DW_AT_name => {
+                                    if let Ok(attr_name) = dwarf.attr_string(&unit, attr.value()) {
+                                        if attr_name.to_string_lossy() == name {
+                                            name_match = true;
+                                        }
+                                    }
+                                }
+                                gimli::DW_AT_location => {
+                                    location = attr.value().exprloc_value();
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if name_match {
+                            if let Some(expr) = location {
+                                let expr: gimli::Expression<EndianSlice<RunTimeEndian>> = expr;
+                                self.evaluate_expression(&unit, expr)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        error!("variable {} not found in current scope", name);
+        Ok(())
+    }
+
+    fn evaluate_expression(
+        &self,
+        unit: &gimli::Unit<EndianSlice<RunTimeEndian>, usize>,
+        expr: gimli::Expression<EndianSlice<RunTimeEndian>>,
+    ) -> anyhow::Result<()> {
+        let mut evaluation = expr.evaluation(unit.encoding());
+        let mut result = evaluation.evaluate()?;
+
+        while let gimli::EvaluationResult::RequiresRegister { register, .. } = result {
+            let reg_val = self.get_register_value_by_number(register.0)?;
+            result = evaluation.resume_with_register(gimli::Value::U64(reg_val))?;
+        }
+
+        if let gimli::EvaluationResult::Complete = result {
+            let pieces = evaluation.result();
+            for piece in pieces {
+                match piece.location {
+                    gimli::Location::Address { address } => {
+                        let val = ptrace::read(self.process, address as _)?;
+                        println!("0x{:x}", val);
+                    }
+                    gimli::Location::Register { register } => {
+                        let val = self.get_register_value_by_number(register.0)?;
+                        println!("0x{:x}", val);
+                    }
+                    _ => error!("unsupported variable location"),
+                }
+            }
+        } else {
+            error!("failed to evaluate expression");
+        }
+        Ok(())
+    }
+
+    fn get_register_value_by_number(&self, reg_num: u16) -> anyhow::Result<u64> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let regs = ptrace::getregs(self.process)?;
+            // DWARF register numbers for x86_64: rax=0, rdx=1, rcx=2, rbx=3, rsp=7, rbp=6, etc.
+            match reg_num {
+                0 => Ok(regs.rax),
+                1 => Ok(regs.rdx),
+                2 => Ok(regs.rcx),
+                3 => Ok(regs.rbx),
+                4 => Ok(regs.rsi),
+                5 => Ok(regs.rdi),
+                6 => Ok(regs.rbp),
+                7 => Ok(regs.rsp),
+                8 => Ok(regs.r8),
+                9 => Ok(regs.r9),
+                10 => Ok(regs.r10),
+                11 => Ok(regs.r11),
+                12 => Ok(regs.r12),
+                13 => Ok(regs.r13),
+                14 => Ok(regs.r14),
+                15 => Ok(regs.r15),
+                16 => Ok(regs.rip),
+                _ => Err(anyhow::anyhow!("unsupported register number {}", reg_num)),
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let regs = ptrace::getregs(self.process)?;
+            if reg_num < 31 {
+                Ok(regs.x[reg_num as usize])
+            } else if reg_num == 31 {
+                Ok(regs.sp)
+            } else if reg_num == 32 {
+                Ok(regs.pc)
+            } else {
+                Err(anyhow::anyhow!("unsupported register number {}", reg_num))
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        compile_error!("Unsupported architecture");
     }
 
     fn backtrace(&self) -> anyhow::Result<()> {
@@ -588,17 +753,32 @@ impl Debugger {
         while let Some(header) = iter.next()? {
             let unit = dwarf.unit(header)?;
             let mut entries = unit.entries();
-            while let Some((_, entry)) = entries.next_dfs()? {
+            while let Some(entry) = entries.next_dfs()? {
                 if entry.tag() == gimli::DW_TAG_subprogram {
-                    if let Some(attr) = entry.attr_value(gimli::DW_AT_name)? {
-                        if let Ok(attr_name) = dwarf.attr_string(&unit, attr) {
-                            if attr_name.to_string_lossy() == name {
-                                if let Some(attr_low_pc) = entry.attr_value(gimli::DW_AT_low_pc)? {
-                                    if let gimli::AttributeValue::Addr(addr) = attr_low_pc {
-                                        return Ok(Some(addr + self.load_address as u64));
+                    let mut name_match = false;
+                    let mut low_pc = None;
+
+                    for attr in entry.attrs() {
+                        match attr.name() {
+                            gimli::DW_AT_name => {
+                                if let Ok(attr_name) = dwarf.attr_string(&unit, attr.value()) {
+                                    if attr_name.to_string_lossy() == name {
+                                        name_match = true;
                                     }
                                 }
                             }
+                            gimli::DW_AT_low_pc => {
+                                if let gimli::AttributeValue::Addr(addr) = attr.value() {
+                                    low_pc = Some(addr);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if name_match {
+                        if let Some(addr) = low_pc {
+                            return Ok(Some(addr + self.load_address as u64));
                         }
                     }
                 }
@@ -621,14 +801,11 @@ impl Debugger {
                 while let Some((_, row)) = rows.next_row()? {
                     if let Some(row_line) = row.line() {
                         if row_line.get() == line {
-                            if let Some(file_index) = row.file_index() {
-                                if let Some(f) = line_program.header().file(file_index) {
-                                    if let Ok(name) = dwarf.attr_string(&unit, f.path_name()) {
-                                        if name.to_string_lossy().ends_with(file) {
-                                            return Ok(Some(
-                                                row.address() + self.load_address as u64,
-                                            ));
-                                        }
+                            let file_index = row.file_index();
+                            if let Some(f) = line_program.header().file(file_index) {
+                                if let Ok(name) = dwarf.attr_string(&unit, f.path_name()) {
+                                    if name.to_string_lossy().ends_with(file) {
+                                        return Ok(Some(row.address() + self.load_address as u64));
                                     }
                                 }
                             }

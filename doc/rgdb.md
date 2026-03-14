@@ -208,3 +208,23 @@ gdb> break main
 ```text
 gdb> break target_bin.rs:25
 ```
+
+## Handling Variables (Step 9)
+
+实现了读取并打印源代码变量值的功能。
+
+### 变量查找
+1. **获取当前作用域**: 根据当前的 `PC` 指针，在 DWARF 信息中定位当前的子程序（Subprogram）。
+2. **名称匹配**: 在当前子程序的作用域内，查找匹配给定名称的 `DW_TAG_variable` 或 `DW_TAG_formal_parameter` 标签。
+3. **位置评估**: 解析变量的 `DW_AT_location` 属性。
+
+### DWARF 表达式求值
+使用了 `gimli` 库的表达式评估器来处理复杂的变量存储位置：
+- **寄存器存储**: 如果变量存储在寄存器中，调试器会读取相应的 CPU 寄存器。
+- **内存/栈存储**: 如果变量存储在内存中（例如局部变量在栈上），调试器会计算出地址并使用 `ptrace(PTRACE_PEEKDATA)` 读取。
+- **寄存器映射**: 实现了 DWARF 寄存器编号到物理寄存器的映射（支持 x86_64 和 AArch64）。
+
+```text
+gdb> print counter
+0x5
+```
