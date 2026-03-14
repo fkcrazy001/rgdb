@@ -37,10 +37,7 @@ enum SubCommands {
     #[command(alias = "c")]
     Continue,
     #[command(alias = "b")]
-    Break {
-        #[arg(value_parser = parse_hex_usize)]
-        address: usize,
-    },
+    Break { location: String },
     #[command(alias = "reg")]
     Register {
         #[command(subcommand)]
@@ -226,7 +223,7 @@ impl Debugger {
                         Ok(cmd) => match cmd.cmds {
                             SubCommands::Quit => break,
                             SubCommands::Continue => self.cont()?,
-                            SubCommands::Break { address } => self.set_breakpoint(address)?,
+                            SubCommands::Break { location } => self.handle_break_cmd(&location)?,
                             SubCommands::Register { cmd } => self.handle_register_cmd(cmd)?,
                             SubCommands::Memory { cmd } => self.handle_memory_cmd(cmd)?,
                             SubCommands::StepInstruction => self.step_instruction()?,
@@ -514,6 +511,93 @@ impl Debugger {
             }
         }
         Ok(())
+    }
+
+    fn handle_break_cmd(&mut self, location: &str) -> anyhow::Result<()> {
+        if let Ok(addr) = parse_hex_usize(location) {
+            self.set_breakpoint(addr)?;
+        } else if location.contains(':') {
+            let parts: Vec<&str> = location.split(':').collect();
+            if parts.len() == 2 {
+                let file = parts[0];
+                if let Ok(line) = parts[1].parse::<u64>() {
+                    if let Some(addr) = self.lookup_line_address(file, line)? {
+                        self.set_breakpoint(addr as usize)?;
+                    } else {
+                        error!("could not find address for {}:{}", file, line);
+                    }
+                }
+            }
+        } else {
+            if let Some(addr) = self.lookup_function_address(location)? {
+                self.set_breakpoint(addr as usize)?;
+            } else {
+                error!("could not find function {}", location);
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_function_address(&self, name: &str) -> anyhow::Result<Option<u64>> {
+        let dwarf = match &self.dwarf {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let mut iter = dwarf.units();
+        while let Some(header) = iter.next()? {
+            let unit = dwarf.unit(header)?;
+            let mut entries = unit.entries();
+            while let Some((_, entry)) = entries.next_dfs()? {
+                if entry.tag() == gimli::DW_TAG_subprogram {
+                    if let Some(attr) = entry.attr_value(gimli::DW_AT_name)? {
+                        if let Ok(attr_name) = dwarf.attr_string(&unit, attr) {
+                            if attr_name.to_string_lossy() == name {
+                                if let Some(attr_low_pc) = entry.attr_value(gimli::DW_AT_low_pc)? {
+                                    if let gimli::AttributeValue::Addr(addr) = attr_low_pc {
+                                        return Ok(Some(addr + self.load_address as u64));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn lookup_line_address(&self, file: &str, line: u64) -> anyhow::Result<Option<u64>> {
+        let dwarf = match &self.dwarf {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let mut iter = dwarf.units();
+        while let Some(header) = iter.next()? {
+            let unit = dwarf.unit(header)?;
+            if let Some(ref line_program) = unit.line_program {
+                let mut rows = line_program.clone().rows();
+                while let Some((_, row)) = rows.next_row()? {
+                    if let Some(row_line) = row.line() {
+                        if row_line.get() == line {
+                            if let Some(file_index) = row.file_index() {
+                                if let Some(f) = line_program.header().file(file_index) {
+                                    if let Ok(name) = dwarf.attr_string(&unit, f.path_name()) {
+                                        if name.to_string_lossy().ends_with(file) {
+                                            return Ok(Some(
+                                                row.address() + self.load_address as u64,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn lookup_symbol(&self, _name: &str) -> anyhow::Result<Option<u64>> {
