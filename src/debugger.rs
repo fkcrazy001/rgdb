@@ -51,6 +51,14 @@ enum SubCommands {
         #[command(subcommand)]
         cmd: MemoryCommand,
     },
+    #[command(alias = "si")]
+    StepInstruction,
+    #[command(alias = "s")]
+    Step,
+    #[command(alias = "n")]
+    Next,
+    #[command(alias = "fin")]
+    Finish,
 }
 
 #[derive(Subcommand, Debug)]
@@ -221,6 +229,10 @@ impl Debugger {
                             SubCommands::Break { address } => self.set_breakpoint(address)?,
                             SubCommands::Register { cmd } => self.handle_register_cmd(cmd)?,
                             SubCommands::Memory { cmd } => self.handle_memory_cmd(cmd)?,
+                            SubCommands::StepInstruction => self.step_instruction()?,
+                            SubCommands::Step => self.step_source()?,
+                            SubCommands::Next => self.next_source()?,
+                            SubCommands::Finish => self.finish()?,
                         },
                         Err(e) => {
                             error!("cmd parse failed, {e}");
@@ -306,8 +318,93 @@ impl Debugger {
         Ok(())
     }
 
+    fn finish(&mut self) -> anyhow::Result<()> {
+        let pc = self.get_pc()?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let regs = ptrace::getregs(self.process)?;
+            let ret_addr = ptrace::read(self.process, regs.rsp as _)? as u64;
+            info!(
+                "setting temporary breakpoint at return address 0x{:x}",
+                ret_addr
+            );
+            self.set_breakpoint(ret_addr as usize)?;
+            self.cont()?;
+            // TODO: remove temporary breakpoint
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let regs = ptrace::getregs(self.process)?;
+            let ret_addr = regs.x[30]; // LR
+            info!(
+                "setting temporary breakpoint at return address 0x{:x}",
+                ret_addr
+            );
+            self.set_breakpoint(ret_addr as usize)?;
+            self.cont()?;
+        }
+        Ok(())
+    }
+
+    fn step_source(&mut self) -> anyhow::Result<()> {
+        let pc = self.get_pc()?;
+        let start_loc = self.lookup_source_location(pc)?;
+
+        loop {
+            self.step_instruction()?;
+            let new_pc = self.get_pc()?;
+            let new_loc = self.lookup_source_location(new_pc)?;
+
+            match (&start_loc, &new_loc) {
+                (Some(s), Some(n)) if s.file == n.file && s.line == n.line => continue,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn next_source(&mut self) -> anyhow::Result<()> {
+        // Simplified next: just step for now, properly implementing this requires
+        // either an instruction decoder or a deeper understanding of the line table.
+        self.step_source()
+    }
+
+    fn step_instruction(&mut self) -> anyhow::Result<()> {
+        let pc = self.get_pc()?;
+        #[cfg(target_arch = "x86_64")]
+        let breakpoint_addr = (pc - 1) as usize;
+        #[cfg(target_arch = "aarch64")]
+        let breakpoint_addr = pc as usize;
+
+        if self.breakpoints.contains_key(&breakpoint_addr) {
+            info!("stepping over breakpoint at 0x{:x}", breakpoint_addr);
+            #[cfg(target_arch = "x86_64")]
+            self.set_pc(breakpoint_addr as u64)?;
+
+            let original_data = self.breakpoints[&breakpoint_addr];
+            ptrace::write(self.process, breakpoint_addr as _, original_data as _)?;
+
+            ptrace::step(self.process, None)?;
+            self.wait4()?;
+
+            self.set_breakpoint(breakpoint_addr)?;
+            // We already did one step, so we are done with si
+            let status = self.wait4_no_log()?; // Consume the stop from step if any? No, ptrace::step already stopped.
+        // Wait, ptrace::step already results in a SIGTRAP.
+        } else {
+            ptrace::step(self.process, None)?;
+            let status = self.wait4()?;
+            self.handle_wait_status(status)?;
+        }
+        Ok(())
+    }
+
     fn wait4(&self) -> anyhow::Result<WaitStatus> {
         info!("wait");
+        waitpid(self.process, None).context("failed to wait")
+    }
+
+    fn wait4_no_log(&self) -> anyhow::Result<WaitStatus> {
         waitpid(self.process, None).context("failed to wait")
     }
 
