@@ -289,8 +289,17 @@ impl Debugger {
                 let mut output = format!("Stopped by signal {:?} at 0x{:x}", sig, pc);
                 if let Ok(Some(loc)) = self.lookup_source_location(lookup_addr) {
                     output.push_str(&format!(" [{}:{}:{}]", loc.file, loc.line, loc.column));
+                    info!("{}", output);
+                    let _ = self.display_source(&loc.file, loc.line, 3);
+                } else {
+                    info!("{}", output);
                 }
-                info!("{}", output);
+            }
+            WaitStatus::Exited(_, code) => {
+                info!("Process exited with code {}", code);
+            }
+            WaitStatus::Signaled(_, sig, _) => {
+                info!("Process killed by signal {:?}", sig);
             }
             _ => info!("process received status {:?}", status),
         }
@@ -379,6 +388,35 @@ impl Debugger {
             }
         }
         Ok(None)
+    }
+
+    fn display_source(&self, file_path: &str, line: u64, context_lines: u64) -> anyhow::Result<()> {
+        let file = match fs::read_to_string(file_path) {
+            Ok(f) => f,
+            Err(_) => {
+                // Try relative path from current directory
+                let mut rel_path = PathBuf::from(".");
+                rel_path.push(file_path);
+                fs::read_to_string(rel_path)
+                    .context(format!("failed to read source file {}", file_path))?
+            }
+        };
+
+        let start_line = if line > context_lines {
+            line - context_lines
+        } else {
+            1
+        };
+        let end_line = line + context_lines;
+
+        for (idx, content) in file.lines().enumerate() {
+            let current_line = (idx + 1) as u64;
+            if current_line >= start_line && current_line <= end_line {
+                let prefix = if current_line == line { "=> " } else { "   " };
+                println!("{}{:4} {}", prefix, current_line, content);
+            }
+        }
+        Ok(())
     }
 
     fn lookup_symbol(&self, _name: &str) -> anyhow::Result<Option<u64>> {
