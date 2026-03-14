@@ -5,15 +5,16 @@ edition = "2024"
 description = "Gdb write in Rust"
 
 [[bin]]
-name = "hello"
-path = "src/hello.rs"
+name = "target_bin"
+path = "src/target_bin.rs"
 
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.5.60", features = ["derive"] }
 
-nix = { version = "0.31.2", features = ["ptrace", "process"] }
+nix = { version = "0.31.2", features = ["ptrace", "process", "personality"] }
 gimli = "0.33.0"
+object = "0.36.0"
 log = "0.4.29"
 rustyline = "17.0.2"
 shlex = "1.3.0"

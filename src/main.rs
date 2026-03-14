@@ -7,7 +7,7 @@ use clap::Parser;
 use log::{Log, info};
 use nix::{
     libc::{SIGSTOP, SIGTRAP, raise},
-    sys::{ptrace, wait::waitpid},
+    sys::{personality, ptrace, wait::waitpid},
     unistd::{ForkResult, execvp, fork},
 };
 
@@ -42,6 +42,7 @@ fn main() -> anyhow::Result<()> {
     log::set_logger(&LOGGER).map_err(|e| std::io::Error::other(e.to_string()))?;
     log::set_max_level(log::LevelFilter::Info);
     log::info!("args {prog:?}");
+    let prog_path = prog.program.clone();
     let pn = CString::new(prog.program)?;
     let mut args = vec![pn.clone()];
     args.append(
@@ -74,7 +75,7 @@ fn main() -> anyhow::Result<()> {
         }
         ForkResult::Parent { child } => child,
     };
-    let mut debugger = debugger::Debugger::new(pid);
+    let mut debugger = debugger::Debugger::new(pid, prog_path)?;
 
     debugger.run()
 }
