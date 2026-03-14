@@ -228,3 +228,18 @@ gdb> break target_bin.rs:25
 gdb> print counter
 0x5
 ```
+
+## Advanced Topics (Step 10)
+
+本阶段探索了一些高级调试技术，主要包括对符号表（Symbol Table）的支持。
+
+### 符号表支持 (ELF Symbols)
+即使二进制文件被剥离（stripped）了 DWARF 调试信息，或者在调试某些系统库时，我们仍然可以通过 ELF 符号表来设置断点。
+1. **加载符号**: 在初始化时使用 `object` 库解析 ELF 的 `.symtab` 或 `.dynsym` 段。
+2. **符号查找**: 实现了 `lookup_symbol`，允许用户通过导出的符号名称进行断点设置。
+3. **加载地址适配**: 与 DWARF 映射一致，符号地址也会根据进程的加载基址（Load Address）进行动态偏移计算。
+
+```text
+gdb> break malloc
+# 即使没有源码，也能在库函数入口设置断点
+```

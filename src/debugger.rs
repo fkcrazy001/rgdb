@@ -11,7 +11,7 @@ use nix::{
     },
     unistd::Pid,
 };
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSymbol};
 use rustyline::DefaultEditor;
 
 pub struct Debugger {
@@ -19,6 +19,7 @@ pub struct Debugger {
     breakpoints: HashMap<usize, i64>,
     dwarf: Option<Dwarf<EndianSlice<'static, RunTimeEndian>>>,
     load_address: usize,
+    symbols: HashMap<String, u64>,
     // Store the loaded ELF data to keep the 'static lifetime for EndianSlice
     _elf_data: Vec<u8>,
 }
@@ -114,13 +115,27 @@ struct SourceLocation {
 impl Debugger {
     pub fn new(process: Pid, program_path: String) -> anyhow::Result<Self> {
         let (dwarf, elf_data) = Self::load_debug_info(&program_path)?;
+        let symbols = Self::load_symbols(&program_path)?;
         Ok(Self {
             process,
             breakpoints: HashMap::new(),
             dwarf,
             load_address: 0, // Will be updated after exec
+            symbols,
             _elf_data: elf_data,
         })
+    }
+
+    fn load_symbols(path: &str) -> anyhow::Result<HashMap<String, u64>> {
+        let data = fs::read(path)?;
+        let obj = object::File::parse(&*data)?;
+        let mut symbols = HashMap::new();
+        for symbol in obj.symbols() {
+            if let Ok(name) = symbol.name() {
+                symbols.insert(name.to_string(), symbol.address());
+            }
+        }
+        Ok(symbols)
     }
 
     fn update_load_address(&mut self) -> anyhow::Result<()> {
@@ -736,8 +751,10 @@ impl Debugger {
         } else {
             if let Some(addr) = self.lookup_function_address(location)? {
                 self.set_breakpoint(addr as usize)?;
+            } else if let Some(addr) = self.lookup_symbol(location)? {
+                self.set_breakpoint(addr as usize)?;
             } else {
-                error!("could not find function {}", location);
+                error!("could not find function or symbol {}", location);
             }
         }
         Ok(())
@@ -817,9 +834,10 @@ impl Debugger {
         Ok(None)
     }
 
-    fn lookup_symbol(&self, _name: &str) -> anyhow::Result<Option<u64>> {
-        // ELF symbol table lookup can be added here
-        // For now, focus on DWARF source mapping
+    fn lookup_symbol(&self, name: &str) -> anyhow::Result<Option<u64>> {
+        if let Some(addr) = self.symbols.get(name) {
+            return Ok(Some(addr + self.load_address as u64));
+        }
         Ok(None)
     }
 
