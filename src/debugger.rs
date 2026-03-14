@@ -139,7 +139,8 @@ impl Debugger {
     }
 
     fn update_load_address(&mut self) -> anyhow::Result<()> {
-        let maps = fs::read_to_string(format!("/proc/{}/maps", self.process.as_raw()))?;
+        let maps = fs::read_to_string(format!("/proc/{}/maps", self.process.as_raw()))
+            .context("failed to read /proc//maps")?;
         if let Some(line) = maps.lines().next() {
             let addr_str = line.split('-').next().context("failed to parse maps")?;
             self.load_address = usize::from_str_radix(addr_str, 16)?;
@@ -602,12 +603,10 @@ impl Debugger {
             ptrace::write(self.process, breakpoint_addr as _, original_data as _)?;
 
             ptrace::step(self.process, None)?;
-            self.wait4()?;
+            let status = self.wait4()?;
+            self.handle_wait_status(status)?;
 
             self.set_breakpoint(breakpoint_addr)?;
-            // We already did one step, so we are done with si
-            let status = self.wait4_no_log()?; // Consume the stop from step if any? No, ptrace::step already stopped.
-        // Wait, ptrace::step already results in a SIGTRAP.
         } else {
             ptrace::step(self.process, None)?;
             let status = self.wait4()?;
@@ -618,10 +617,6 @@ impl Debugger {
 
     fn wait4(&self) -> anyhow::Result<WaitStatus> {
         info!("wait");
-        waitpid(self.process, None).context("failed to wait")
-    }
-
-    fn wait4_no_log(&self) -> anyhow::Result<WaitStatus> {
         waitpid(self.process, None).context("failed to wait")
     }
 
