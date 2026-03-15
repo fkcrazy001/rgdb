@@ -1,13 +1,9 @@
-use std::{
-    ffi::{CStr, CString},
-    process::{Command, Stdio},
-};
+use std::ffi::CString;
 mod debugger;
 use clap::Parser;
 use log::{Log, info};
 use nix::{
-    libc::{SIGSTOP, SIGTRAP, raise},
-    sys::{personality, ptrace, wait::waitpid},
+    sys::ptrace,
     unistd::{ForkResult, execvp, fork},
 };
 

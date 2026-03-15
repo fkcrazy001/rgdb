@@ -537,7 +537,7 @@ impl Debugger {
     }
 
     fn finish(&mut self) -> anyhow::Result<()> {
-        let pc = self.get_pc()?;
+        let _pc = self.get_pc()?;
         #[cfg(target_arch = "x86_64")]
         {
             let regs = ptrace::getregs(self.process)?;
