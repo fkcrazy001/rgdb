@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
+};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -20,6 +24,7 @@ pub struct Debugger {
     dwarf: Option<Dwarf<EndianSlice<'static, RunTimeEndian>>>,
     load_address: usize,
     symbols: HashMap<String, u64>,
+    temp_breakpoints: HashSet<usize>,
     // Store the loaded ELF data to keep the 'static lifetime for EndianSlice
     _elf_data: Vec<u8>,
 }
@@ -122,6 +127,7 @@ impl Debugger {
             dwarf,
             load_address: 0, // Will be updated after exec
             symbols,
+            temp_breakpoints: HashSet::new(),
             _elf_data: elf_data,
         })
     }
@@ -262,7 +268,7 @@ impl Debugger {
                 Err(_) => todo!(),
             }
         }
-        rl.save_history(path)?;
+        let _ = rl.save_history(path);
         Ok(())
     }
 
@@ -290,8 +296,12 @@ impl Debugger {
             ptrace::step(self.process, None).context("failed to step")?;
             self.wait4()?;
 
-            // 4. Re-insert breakpoint
-            self.set_breakpoint(breakpoint_addr)?;
+            // 4. Re-insert breakpoint (unless temporary)
+            if self.temp_breakpoints.remove(&breakpoint_addr) {
+                self.breakpoints.remove(&breakpoint_addr);
+            } else {
+                self.set_breakpoint(breakpoint_addr)?;
+            }
         }
 
         ptrace::cont(self.process, None).context("failed to continue process")?;
@@ -547,8 +557,8 @@ impl Debugger {
                 ret_addr
             );
             self.set_breakpoint(ret_addr as usize)?;
+            self.temp_breakpoints.insert(ret_addr as usize);
             self.cont()?;
-            // TODO: remove temporary breakpoint
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -559,6 +569,7 @@ impl Debugger {
                 ret_addr
             );
             self.set_breakpoint(ret_addr as usize)?;
+            self.temp_breakpoints.insert(ret_addr as usize);
             self.cont()?;
         }
         Ok(())
@@ -582,9 +593,35 @@ impl Debugger {
     }
 
     fn next_source(&mut self) -> anyhow::Result<()> {
-        // Simplified next: just step for now, properly implementing this requires
-        // either an instruction decoder or a deeper understanding of the line table.
-        self.step_source()
+        let pc = self.get_pc()?;
+        #[cfg(target_arch = "x86_64")]
+        let lookup_pc = pc
+            .checked_sub(1)
+            .filter(|p| self.breakpoints.contains_key(&(*p as usize)))
+            .unwrap_or(pc);
+        #[cfg(target_arch = "aarch64")]
+        let lookup_pc = pc;
+
+        let loc = match self.lookup_source_location(lookup_pc)? {
+            Some(l) => l,
+            None => return self.step_source(),
+        };
+
+        let pc_offset = if lookup_pc >= self.load_address as u64 {
+            lookup_pc - self.load_address as u64
+        } else {
+            lookup_pc
+        };
+
+        let next_offset = match self.lookup_next_line_offset(&loc.file, loc.line, pc_offset)? {
+            Some(a) => a,
+            None => return self.step_source(),
+        };
+
+        let addr = next_offset + self.load_address as u64;
+        self.set_breakpoint(addr as usize)?;
+        self.temp_breakpoints.insert(addr as usize);
+        self.cont()
     }
 
     fn step_instruction(&mut self) -> anyhow::Result<()> {
@@ -606,7 +643,11 @@ impl Debugger {
             let status = self.wait4()?;
             self.handle_wait_status(status)?;
 
-            self.set_breakpoint(breakpoint_addr)?;
+            if self.temp_breakpoints.remove(&breakpoint_addr) {
+                self.breakpoints.remove(&breakpoint_addr);
+            } else {
+                self.set_breakpoint(breakpoint_addr)?;
+            }
         } else {
             ptrace::step(self.process, None)?;
             let status = self.wait4()?;
@@ -637,6 +678,60 @@ impl Debugger {
         ptrace::write(self.process, address as _, trap_data as _)
             .context("failed to write trap instruction")?;
         Ok(())
+    }
+
+    fn lookup_next_line_offset(
+        &self,
+        file: &str,
+        line: u64,
+        current_offset: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        let dwarf = match &self.dwarf {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let target_basename = PathBuf::from(file)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_string());
+
+        let mut best: Option<u64> = None;
+        let mut iter = dwarf.units();
+        while let Some(header) = iter.next()? {
+            let unit = dwarf.unit(header)?;
+            if let Some(ref line_program) = unit.line_program {
+                let mut rows = line_program.clone().rows();
+                while let Some((_, row)) = rows.next_row()? {
+                    let addr = row.address();
+                    if addr <= current_offset {
+                        continue;
+                    }
+                    let row_line = match row.line() {
+                        Some(l) => l.get(),
+                        None => continue,
+                    };
+                    if row_line == line {
+                        continue;
+                    }
+                    let file_index = row.file_index();
+                    let row_file = line_program
+                        .header()
+                        .file(file_index)
+                        .and_then(|f| dwarf.attr_string(&unit, f.path_name()).ok())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !row_file.ends_with(&target_basename) && row_file != file {
+                        continue;
+                    }
+                    best = match best {
+                        Some(b) if b <= addr => Some(b),
+                        _ => Some(addr),
+                    };
+                }
+            }
+        }
+        Ok(best)
     }
 
     fn lookup_source_location(&self, addr: u64) -> anyhow::Result<Option<SourceLocation>> {
