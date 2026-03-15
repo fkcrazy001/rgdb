@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::PathBuf,
-};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -20,13 +16,12 @@ use rustyline::DefaultEditor;
 
 pub struct Debugger {
     process: Pid,
-    breakpoints: HashMap<usize, i64>,
+    breakpoints: HashMap<usize, Breakpoint>,
     dwarf: Option<Dwarf<EndianSlice<'static, RunTimeEndian>>>,
     load_address: usize,
+    is_pie: bool,
     symbols: HashMap<String, u64>,
-    temp_breakpoints: HashSet<usize>,
-    // Store the loaded ELF data to keep the 'static lifetime for EndianSlice
-    _elf_data: Vec<u8>,
+    inferior_exited: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -117,19 +112,75 @@ struct SourceLocation {
     column: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BreakpointPatch {
+    base: usize,
+    mask: u64,
+    orig: u64,
+    trap: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Breakpoint {
+    patch: BreakpointPatch,
+    temporary: bool,
+}
+
 impl Debugger {
+    fn base_address(&self) -> u64 {
+        if self.is_pie {
+            self.load_address as u64
+        } else {
+            0
+        }
+    }
+
+    fn runtime_to_offset(&self, addr: u64) -> u64 {
+        let base = self.base_address();
+        if self.is_pie && addr >= base {
+            addr - base
+        } else {
+            addr
+        }
+    }
+
+    fn offset_to_runtime(&self, offset: u64) -> u64 {
+        offset + self.base_address()
+    }
+
     pub fn new(process: Pid, program_path: String) -> anyhow::Result<Self> {
-        let (dwarf, elf_data) = Self::load_debug_info(&program_path)?;
+        let dwarf = Self::load_debug_info(&program_path)?;
         let symbols = Self::load_symbols(&program_path)?;
+        let is_pie = Self::detect_pie(&program_path)?;
         Ok(Self {
             process,
             breakpoints: HashMap::new(),
             dwarf,
             load_address: 0, // Will be updated after exec
+            is_pie,
             symbols,
-            temp_breakpoints: HashSet::new(),
-            _elf_data: elf_data,
+            inferior_exited: false,
         })
+    }
+
+    fn detect_pie(path: &str) -> anyhow::Result<bool> {
+        let header =
+            fs::read(path).with_context(|| format!("failed to read ELF file at {}", path))?;
+        if header.len() < 0x20 {
+            return Ok(false);
+        }
+        if &header[0..4] != b"\x7fELF" {
+            return Ok(false);
+        }
+        let endian = header[5];
+        let e_type_bytes = &header[16..18];
+        let e_type = match endian {
+            1 => u16::from_le_bytes([e_type_bytes[0], e_type_bytes[1]]),
+            2 => u16::from_be_bytes([e_type_bytes[0], e_type_bytes[1]]),
+            _ => return Ok(false),
+        };
+        // ET_DYN (3) usually indicates PIE for executables built as position independent
+        Ok(e_type == 3)
     }
 
     fn load_symbols(path: &str) -> anyhow::Result<HashMap<String, u64>> {
@@ -145,8 +196,12 @@ impl Debugger {
     }
 
     fn update_load_address(&mut self) -> anyhow::Result<()> {
+        if !self.is_pie {
+            self.load_address = 0;
+            return Ok(());
+        }
         let maps = fs::read_to_string(format!("/proc/{}/maps", self.process.as_raw()))
-            .context("failed to read /proc//maps")?;
+            .with_context(|| format!("failed to read /proc/{}/maps", self.process.as_raw()))?;
         if let Some(line) = maps.lines().next() {
             let addr_str = line.split('-').next().context("failed to parse maps")?;
             self.load_address = usize::from_str_radix(addr_str, 16)?;
@@ -157,14 +212,14 @@ impl Debugger {
 
     fn load_debug_info(
         path: &str,
-    ) -> anyhow::Result<(Option<Dwarf<EndianSlice<'static, RunTimeEndian>>>, Vec<u8>)> {
+    ) -> anyhow::Result<Option<Dwarf<EndianSlice<'static, RunTimeEndian>>>> {
         let path = PathBuf::from(path);
         let data = fs::read(&path).context(format!("failed to read ELF file at {:?}", path))?;
 
         // 尝试从 ELF 本身加载
-        if let Ok((dwarf, data)) = Self::parse_dwarf(data) {
+        if let Ok(dwarf) = Self::parse_dwarf(data) {
             if dwarf.units().count() > 0 {
-                return Ok((Some(dwarf), data));
+                return Ok(Some(dwarf));
             }
         }
 
@@ -174,8 +229,8 @@ impl Debugger {
         if debug_path.exists() {
             info!("found split debug info at {:?}", debug_path);
             let data = fs::read(&debug_path)?;
-            if let Ok((dwarf, data)) = Self::parse_dwarf(data) {
-                return Ok((Some(dwarf), data));
+            if let Ok(dwarf) = Self::parse_dwarf(data) {
+                return Ok(Some(dwarf));
             }
         }
 
@@ -186,19 +241,17 @@ impl Debugger {
             if system_debug_path.exists() {
                 info!("found system debug info at {:?}", system_debug_path);
                 let data = fs::read(&system_debug_path)?;
-                if let Ok((dwarf, data)) = Self::parse_dwarf(data) {
-                    return Ok((Some(dwarf), data));
+                if let Ok(dwarf) = Self::parse_dwarf(data) {
+                    return Ok(Some(dwarf));
                 }
             }
         }
 
         info!("no debug info found for {:?}", path);
-        Ok((None, Vec::new()))
+        Ok(None)
     }
 
-    fn parse_dwarf(
-        data: Vec<u8>,
-    ) -> anyhow::Result<(Dwarf<EndianSlice<'static, RunTimeEndian>>, Vec<u8>)> {
+    fn parse_dwarf(data: Vec<u8>) -> anyhow::Result<Dwarf<EndianSlice<'static, RunTimeEndian>>> {
         let data = Box::leak(data.into_boxed_slice());
         let obj = object::File::parse(&*data).context("failed to parse ELF")?;
         let endian = if obj.is_little_endian() {
@@ -218,7 +271,7 @@ impl Debugger {
             };
 
         let dwarf = Dwarf::load(&load_section)?;
-        Ok((dwarf, Vec::new())) // Since we leak, Vec is empty
+        Ok(dwarf)
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -226,11 +279,13 @@ impl Debugger {
         info!("Started debugging process: {}", pid);
         let mut rl = DefaultEditor::new()?;
         let path = ".rgdb_history";
-        rl.set_helper(Some(()));
         rl.load_history(path).ok();
         // wait for trap, caused by traceme
         let status = self.wait4()?;
         self.handle_wait_status(status)?;
+        if self.inferior_exited {
+            return Ok(());
+        }
 
         loop {
             match rl.readline("gdb> ") {
@@ -264,8 +319,11 @@ impl Debugger {
                             // eprintln!("cmd parse failed, {e}")
                         }
                     }
+                    if self.inferior_exited {
+                        break;
+                    }
                 }
-                Err(_) => todo!(),
+                Err(_) => break,
             }
         }
         let _ = rl.save_history(path);
@@ -287,20 +345,20 @@ impl Debugger {
             #[cfg(target_arch = "x86_64")]
             self.set_pc(breakpoint_addr as u64)?;
 
-            // 2. Remove breakpoint temporarily
-            let original_data = self.breakpoints[&breakpoint_addr];
-            ptrace::write(self.process, breakpoint_addr as _, original_data as _)
-                .context("failed to restore original instruction")?;
+            self.disable_breakpoint(breakpoint_addr)?;
 
             // 3. Single step
             ptrace::step(self.process, None).context("failed to step")?;
             self.wait4()?;
 
-            // 4. Re-insert breakpoint (unless temporary)
-            if self.temp_breakpoints.remove(&breakpoint_addr) {
+            if self
+                .breakpoints
+                .get(&breakpoint_addr)
+                .is_some_and(|bp| bp.temporary)
+            {
                 self.breakpoints.remove(&breakpoint_addr);
             } else {
-                self.set_breakpoint(breakpoint_addr)?;
+                self.enable_breakpoint(breakpoint_addr)?;
             }
         }
 
@@ -338,9 +396,11 @@ impl Debugger {
             }
             WaitStatus::Exited(_, code) => {
                 info!("Process exited with code {}", code);
+                self.inferior_exited = true;
             }
             WaitStatus::Signaled(_, sig, _) => {
                 info!("Process killed by signal {:?}", sig);
+                self.inferior_exited = true;
             }
             _ => info!("process received status {:?}", status),
         }
@@ -349,11 +409,7 @@ impl Debugger {
 
     fn print_variable(&self, name: &str) -> anyhow::Result<()> {
         let pc = self.get_pc()?;
-        let offset = if pc >= self.load_address as u64 {
-            pc - self.load_address as u64
-        } else {
-            pc
-        };
+        let offset = self.runtime_to_offset(pc);
 
         let dwarf = match &self.dwarf {
             Some(d) => d,
@@ -400,6 +456,7 @@ impl Debugger {
                     {
                         let mut name_match = false;
                         let mut location = None;
+                        let mut ty = None;
 
                         for attr in entry.attrs() {
                             match attr.name() {
@@ -413,6 +470,11 @@ impl Debugger {
                                 gimli::DW_AT_location => {
                                     location = attr.value().exprloc_value();
                                 }
+                                gimli::DW_AT_type => {
+                                    if let gimli::AttributeValue::UnitRef(o) = attr.value() {
+                                        ty = Some(o);
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -420,7 +482,10 @@ impl Debugger {
                         if name_match {
                             if let Some(expr) = location {
                                 let expr: gimli::Expression<EndianSlice<RunTimeEndian>> = expr;
-                                self.evaluate_expression(&unit, expr)?;
+                                let size = ty
+                                    .and_then(|t| self.resolve_type_size(&unit, t).ok().flatten())
+                                    .unwrap_or(8);
+                                self.evaluate_location_expr(&unit, expr, size)?;
                                 return Ok(());
                             }
                         }
@@ -432,38 +497,116 @@ impl Debugger {
         Ok(())
     }
 
-    fn evaluate_expression(
+    fn evaluate_location_expr(
         &self,
         unit: &gimli::Unit<EndianSlice<RunTimeEndian>, usize>,
         expr: gimli::Expression<EndianSlice<RunTimeEndian>>,
+        size: u64,
     ) -> anyhow::Result<()> {
-        let mut evaluation = expr.evaluation(unit.encoding());
-        let mut result = evaluation.evaluate()?;
-
-        while let gimli::EvaluationResult::RequiresRegister { register, .. } = result {
-            let reg_val = self.get_register_value_by_number(register.0)?;
-            result = evaluation.resume_with_register(gimli::Value::U64(reg_val))?;
-        }
-
-        if let gimli::EvaluationResult::Complete = result {
-            let pieces = evaluation.result();
-            for piece in pieces {
-                match piece.location {
-                    gimli::Location::Address { address } => {
-                        let val = ptrace::read(self.process, address as _)?;
-                        println!("0x{:x}", val);
-                    }
-                    gimli::Location::Register { register } => {
-                        let val = self.get_register_value_by_number(register.0)?;
-                        println!("0x{:x}", val);
-                    }
-                    _ => error!("unsupported variable location"),
-                }
+        let mut ops = expr.operations(unit.encoding());
+        let op = match ops.next()? {
+            Some(o) => o,
+            None => {
+                error!("empty location expression");
+                return Ok(());
             }
-        } else {
-            error!("failed to evaluate expression");
+        };
+
+        match op {
+            gimli::Operation::FrameOffset { offset } => {
+                let cfa = self.get_cfa()?;
+                let addr = (cfa as i64).wrapping_add(offset) as u64;
+                let bytes = self.read_memory_bytes(addr, size as usize)?;
+                println!("{}", self.format_scalar(&bytes));
+            }
+            gimli::Operation::Register { register } => {
+                let val = self.get_register_value_by_number(register.0)?;
+                println!("0x{:x}", val);
+            }
+            gimli::Operation::Address { address } => {
+                let bytes = self.read_memory_bytes(address, size as usize)?;
+                println!("{}", self.format_scalar(&bytes));
+            }
+            _ => {
+                error!("unsupported variable location");
+            }
         }
         Ok(())
+    }
+
+    fn resolve_type_size(
+        &self,
+        unit: &gimli::Unit<EndianSlice<RunTimeEndian>, usize>,
+        mut ty: gimli::UnitOffset<usize>,
+    ) -> anyhow::Result<Option<u64>> {
+        for _ in 0..16 {
+            let mut entries = unit.entries();
+            while let Some(entry) = entries.next_dfs()? {
+                if entry.offset() != ty {
+                    continue;
+                }
+
+                if let Some(gimli::AttributeValue::Udata(size)) =
+                    entry.attr_value(gimli::DW_AT_byte_size)
+                {
+                    return Ok(Some(size));
+                }
+                if let Some(next) = entry.attr_value(gimli::DW_AT_type) {
+                    if let gimli::AttributeValue::UnitRef(o) = next {
+                        ty = o;
+                        break;
+                    }
+                    return Ok(None);
+                }
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_cfa(&self) -> anyhow::Result<u64> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let regs = ptrace::getregs(self.process)?;
+            Ok(regs.rbp.wrapping_add(16))
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let regs = ptrace::getregs(self.process)?;
+            Ok(regs.x[29].wrapping_add(16))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        compile_error!("Unsupported architecture");
+    }
+
+    fn read_memory_bytes(&self, address: u64, size: usize) -> anyhow::Result<Vec<u8>> {
+        let mut out = vec![0u8; size];
+        let mut i = 0usize;
+        while i < size {
+            let word = ptrace::read(self.process, (address as usize + i) as _)? as u64;
+            let bytes = word.to_ne_bytes();
+            let take = (size - i).min(bytes.len());
+            out[i..i + take].copy_from_slice(&bytes[..take]);
+            i += take;
+        }
+        Ok(out)
+    }
+
+    fn format_scalar(&self, bytes: &[u8]) -> String {
+        match bytes.len() {
+            1 => format!("0x{:x}", bytes[0]),
+            2 => format!("0x{:x}", u16::from_ne_bytes([bytes[0], bytes[1]])),
+            4 => format!(
+                "0x{:x}",
+                u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            ),
+            _ => {
+                let mut buf = [0u8; 8];
+                let take = bytes.len().min(8);
+                buf[..take].copy_from_slice(&bytes[..take]);
+                format!("0x{:x}", u64::from_ne_bytes(buf))
+            }
+        }
     }
 
     fn get_register_value_by_number(&self, reg_num: u16) -> anyhow::Result<u64> {
@@ -512,17 +655,30 @@ impl Debugger {
     fn backtrace(&self) -> anyhow::Result<()> {
         let mut pc = self.get_pc()?;
         #[cfg(target_arch = "x86_64")]
+        {
+            let bp = pc.saturating_sub(1) as usize;
+            if self.breakpoints.contains_key(&bp) {
+                pc = pc.saturating_sub(1);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
         let mut fp = ptrace::getregs(self.process)?.rbp;
         #[cfg(target_arch = "aarch64")]
         let mut fp = ptrace::getregs(self.process)?.x[29];
 
         let mut frame_num = 0;
         loop {
+            let mut func_info = String::new();
+            if let Ok(Some((name, start))) = self.lookup_function_name(pc) {
+                let delta = pc.saturating_sub(start);
+                func_info = format!(" in {}+0x{:x}", name, delta);
+            }
+
             let mut line_info = String::new();
             if let Ok(Some(loc)) = self.lookup_source_location(pc) {
                 line_info = format!(" at {}:{}:{}", loc.file, loc.line, loc.column);
             }
-            println!("#{} 0x{:016x}{}", frame_num, pc, line_info);
+            println!("#{} 0x{:016x}{}{}", frame_num, pc, func_info, line_info);
 
             if fp == 0 {
                 break;
@@ -546,6 +702,78 @@ impl Debugger {
         Ok(())
     }
 
+    fn lookup_function_name(&self, addr: u64) -> anyhow::Result<Option<(String, u64)>> {
+        let dwarf = match &self.dwarf {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let base = self.base_address();
+        let offset = self.runtime_to_offset(addr);
+
+        let mut iter = dwarf.units();
+        while let Some(header) = iter.next()? {
+            let unit = dwarf.unit(header)?;
+            let mut entries = unit.entries();
+            while let Some(entry) = entries.next_dfs()? {
+                if entry.tag() != gimli::DW_TAG_subprogram {
+                    continue;
+                }
+                let mut low_pc = None;
+                let mut high_pc = None;
+                let mut name = None;
+                for attr in entry.attrs() {
+                    match attr.name() {
+                        gimli::DW_AT_low_pc => {
+                            if let gimli::AttributeValue::Addr(a) = attr.value() {
+                                low_pc = Some(a);
+                            }
+                        }
+                        gimli::DW_AT_high_pc => match attr.value() {
+                            gimli::AttributeValue::Udata(size) => {
+                                if let Some(low) = low_pc {
+                                    high_pc = Some(low + size);
+                                }
+                            }
+                            gimli::AttributeValue::Addr(a) => {
+                                high_pc = Some(a);
+                            }
+                            _ => {}
+                        },
+                        gimli::DW_AT_name => {
+                            if let Ok(s) = dwarf.attr_string(&unit, attr.value()) {
+                                name = Some(s.to_string_lossy().into_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let (Some(low), Some(high), Some(n)) = (low_pc, high_pc, name) else {
+                    continue;
+                };
+                if offset >= low && offset < high {
+                    return Ok(Some((n, low + base)));
+                }
+            }
+        }
+
+        let max_sym = self.symbols.values().copied().max().unwrap_or(0);
+        if max_sym > 0 && offset > max_sym.saturating_add(0x10000) {
+            return Ok(None);
+        }
+
+        let mut best: Option<(String, u64)> = None;
+        for (n, sym_addr) in &self.symbols {
+            if *sym_addr <= offset {
+                best = match best {
+                    Some((_, baddr)) if baddr >= *sym_addr => Some((n.clone(), baddr)),
+                    _ => Some((n.clone(), *sym_addr)),
+                };
+            }
+        }
+        Ok(best.map(|(n, a)| (n, a + base)))
+    }
+
     fn finish(&mut self) -> anyhow::Result<()> {
         let _pc = self.get_pc()?;
         #[cfg(target_arch = "x86_64")]
@@ -556,8 +784,7 @@ impl Debugger {
                 "setting temporary breakpoint at return address 0x{:x}",
                 ret_addr
             );
-            self.set_breakpoint(ret_addr as usize)?;
-            self.temp_breakpoints.insert(ret_addr as usize);
+            self.set_temp_breakpoint(ret_addr as usize)?;
             self.cont()?;
         }
         #[cfg(target_arch = "aarch64")]
@@ -568,8 +795,7 @@ impl Debugger {
                 "setting temporary breakpoint at return address 0x{:x}",
                 ret_addr
             );
-            self.set_breakpoint(ret_addr as usize)?;
-            self.temp_breakpoints.insert(ret_addr as usize);
+            self.set_temp_breakpoint(ret_addr as usize)?;
             self.cont()?;
         }
         Ok(())
@@ -607,20 +833,14 @@ impl Debugger {
             None => return self.step_source(),
         };
 
-        let pc_offset = if lookup_pc >= self.load_address as u64 {
-            lookup_pc - self.load_address as u64
-        } else {
-            lookup_pc
-        };
+        let pc_offset = self.runtime_to_offset(lookup_pc);
 
         let next_offset = match self.lookup_next_line_offset(&loc.file, loc.line, pc_offset)? {
             Some(a) => a,
-            None => return self.step_source(),
+            None => return self.cont(),
         };
 
-        let addr = next_offset + self.load_address as u64;
-        self.set_breakpoint(addr as usize)?;
-        self.temp_breakpoints.insert(addr as usize);
+        self.set_temp_breakpoint(self.offset_to_runtime(next_offset) as usize)?;
         self.cont()
     }
 
@@ -636,17 +856,20 @@ impl Debugger {
             #[cfg(target_arch = "x86_64")]
             self.set_pc(breakpoint_addr as u64)?;
 
-            let original_data = self.breakpoints[&breakpoint_addr];
-            ptrace::write(self.process, breakpoint_addr as _, original_data as _)?;
+            self.disable_breakpoint(breakpoint_addr)?;
 
             ptrace::step(self.process, None)?;
             let status = self.wait4()?;
             self.handle_wait_status(status)?;
 
-            if self.temp_breakpoints.remove(&breakpoint_addr) {
+            if self
+                .breakpoints
+                .get(&breakpoint_addr)
+                .is_some_and(|bp| bp.temporary)
+            {
                 self.breakpoints.remove(&breakpoint_addr);
             } else {
-                self.set_breakpoint(breakpoint_addr)?;
+                self.enable_breakpoint(breakpoint_addr)?;
             }
         } else {
             ptrace::step(self.process, None)?;
@@ -663,20 +886,70 @@ impl Debugger {
 
     fn set_breakpoint(&mut self, address: usize) -> anyhow::Result<()> {
         info!("setting breakpoint at 0x{:x}", address);
-        let data = ptrace::read(self.process, address as _).context("failed to read memory")?;
-        self.breakpoints.insert(address, data);
+        self.insert_breakpoint(address, false)
+    }
+
+    fn set_temp_breakpoint(&mut self, address: usize) -> anyhow::Result<()> {
+        info!("setting breakpoint at 0x{:x}", address);
+        self.insert_breakpoint(address, true)
+    }
+
+    fn insert_breakpoint(&mut self, address: usize, temporary: bool) -> anyhow::Result<()> {
+        if let Some(existing) = self.breakpoints.get_mut(&address) {
+            existing.temporary &= temporary;
+            return Ok(());
+        }
+
+        let base = address & !0x7;
+        let shift = ((address - base) * 8) as u32;
+        let word = ptrace::read(self.process, base as _).context("failed to read memory")? as u64;
 
         #[cfg(target_arch = "x86_64")]
-        let trap_data = (data & !0xFF) | 0xCC;
-
+        let (mask, trap) = (0xffu64 << shift, 0xccu64 << shift);
         #[cfg(target_arch = "aarch64")]
-        let trap_data = (data & !0xFFFFFFFF) | 0xd4200000;
-
+        let (mask, trap) = (0xffff_ffffu64 << shift, 0xd420_0000u64 << shift);
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         compile_error!("Unsupported architecture");
 
-        ptrace::write(self.process, address as _, trap_data as _)
-            .context("failed to write trap instruction")?;
+        let orig = word & mask;
+        let patched = (word & !mask) | trap;
+        ptrace::write(self.process, base as _, patched as _).context("failed to write memory")?;
+        self.breakpoints.insert(
+            address,
+            Breakpoint {
+                patch: BreakpointPatch {
+                    base,
+                    mask,
+                    orig,
+                    trap,
+                },
+                temporary,
+            },
+        );
+        Ok(())
+    }
+
+    fn disable_breakpoint(&mut self, address: usize) -> anyhow::Result<()> {
+        let Some(patch) = self.breakpoints.get(&address).map(|b| b.patch) else {
+            return Ok(());
+        };
+        let word =
+            ptrace::read(self.process, patch.base as _).context("failed to read memory")? as u64;
+        let restored = (word & !patch.mask) | patch.orig;
+        ptrace::write(self.process, patch.base as _, restored as _)
+            .context("failed to write memory")?;
+        Ok(())
+    }
+
+    fn enable_breakpoint(&mut self, address: usize) -> anyhow::Result<()> {
+        let Some(patch) = self.breakpoints.get(&address).map(|b| b.patch) else {
+            return Ok(());
+        };
+        let word =
+            ptrace::read(self.process, patch.base as _).context("failed to read memory")? as u64;
+        let patched = (word & !patch.mask) | patch.trap;
+        ptrace::write(self.process, patch.base as _, patched as _)
+            .context("failed to write memory")?;
         Ok(())
     }
 
@@ -707,11 +980,14 @@ impl Debugger {
                     if addr <= current_offset {
                         continue;
                     }
+                    if !row.is_stmt() {
+                        continue;
+                    }
                     let row_line = match row.line() {
                         Some(l) => l.get(),
                         None => continue,
                     };
-                    if row_line == line {
+                    if row_line <= line {
                         continue;
                     }
                     let file_index = row.file_index();
@@ -740,14 +1016,7 @@ impl Debugger {
             None => return Ok(None),
         };
 
-        // For PIE, we need to subtract the load address to get the offset
-        // For non-PIE, load_address should be what's in the ELF header, but usually 0 is fine if we use offsets.
-        // Actually, let's just try both absolute and relative if needed, but better to be precise.
-        let offset = if addr >= self.load_address as u64 {
-            addr - self.load_address as u64
-        } else {
-            addr
-        };
+        let offset = self.runtime_to_offset(addr);
         info!(
             "looking up source location for addr 0x{:x} (offset 0x{:x}, load_address 0x{:x})",
             addr, offset, self.load_address
@@ -759,8 +1028,7 @@ impl Debugger {
             if let Some(ref line_program) = unit.line_program {
                 let mut rows = line_program.clone().rows();
                 while let Some((_, row)) = rows.next_row()? {
-                    // Check both absolute and relative
-                    if row.address() == offset || row.address() == addr {
+                    if row.address() == offset || (!self.is_pie && row.address() == addr) {
                         let file_index = row.file_index();
                         let file = line_program
                             .header()
@@ -885,7 +1153,15 @@ impl Debugger {
 
                     if name_match {
                         if let Some(addr) = low_pc {
-                            return Ok(Some(addr + self.load_address as u64));
+                            let runtime_low_pc = self.offset_to_runtime(addr);
+                            if let Some(loc) = self.lookup_source_location(runtime_low_pc)? {
+                                if let Some(next) =
+                                    self.lookup_next_line_offset(&loc.file, loc.line, addr)?
+                                {
+                                    return Ok(Some(self.offset_to_runtime(next)));
+                                }
+                            }
+                            return Ok(Some(runtime_low_pc));
                         }
                     }
                 }
@@ -912,7 +1188,7 @@ impl Debugger {
                             if let Some(f) = line_program.header().file(file_index) {
                                 if let Ok(name) = dwarf.attr_string(&unit, f.path_name()) {
                                     if name.to_string_lossy().ends_with(file) {
-                                        return Ok(Some(row.address() + self.load_address as u64));
+                                        return Ok(Some(self.offset_to_runtime(row.address())));
                                     }
                                 }
                             }
@@ -926,7 +1202,7 @@ impl Debugger {
 
     fn lookup_symbol(&self, name: &str) -> anyhow::Result<Option<u64>> {
         if let Some(addr) = self.symbols.get(name) {
-            return Ok(Some(addr + self.load_address as u64));
+            return Ok(Some(self.offset_to_runtime(*addr)));
         }
         Ok(None)
     }
